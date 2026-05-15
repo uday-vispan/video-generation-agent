@@ -22,9 +22,12 @@ const GEMINI_API_KEY = () => process.env.GEMINI_API_KEY
 const GEMINI_IMAGE_MODEL = () => process.env.GEMINI_IMAGE_MODEL || 'gemini-3-pro-image-preview'
 const ELEVENLABS_API_KEY = () => process.env.ELEVENLABS_API_KEY
 // ─── ElevenLabs Voice IDs ─────────────────────────────────────────────────
-// Indian voices: selected by narrator_gender for Hindi and Gujarati.
+// Hindi voices: selected by narrator_gender for Hindi.
 const ELEVENLABS_HINDI_FEMALE_VOICE_ID = process.env.ELEVENLABS_HINDI_FEMALE_VOICE_ID || process.env.ELEVENLABS_FEMALE_VOICE_ID || 'Ms9OTvWb99V6DwRHZn6q'
 const ELEVENLABS_HINDI_MALE_VOICE_ID = process.env.ELEVENLABS_HINDI_MALE_VOICE_ID || process.env.ELEVENLABS_MALE_VOICE_ID || 'SGbOfpm28edC83pZ9iGb'
+// Gujarati voice: single voice selected from ElevenLabs voice library for Gujarati TTS.
+// Uses ELEVENLABS_INDIAN_VOICE_ID (legacy) as fallback, then Hindi, then English.
+const ELEVENLABS_GUJARATI_VOICE_ID = process.env.ELEVENLABS_GUJARATI_VOICE_ID || process.env.ELEVENLABS_INDIAN_VOICE_ID || ELEVENLABS_HINDI_FEMALE_VOICE_ID
 // Non-Hindi/non-Gujarati fallback voices
 const ELEVENLABS_FEMALE_VOICE_ID   = process.env.ELEVENLABS_FEMALE_VOICE_ID  || ELEVENLABS_HINDI_FEMALE_VOICE_ID
 const ELEVENLABS_MALE_VOICE_ID     = process.env.ELEVENLABS_MALE_VOICE_ID    || ELEVENLABS_HINDI_MALE_VOICE_ID
@@ -34,7 +37,10 @@ const BRAND_TAGLINE = () => process.env.BRAND_TAGLINE || ''
 const BRAND_COLOR = () => process.env.BRAND_COLOR || 'ffffff'
 
 const ELEVENLABS_VOICE_ID = (languageCode, gender) => {
-  if (languageCode === 'hi' || languageCode === 'gu') {
+  if (languageCode === 'gu') {
+    return ELEVENLABS_GUJARATI_VOICE_ID
+  }
+  if (languageCode === 'hi') {
     return String(gender || '').toLowerCase().startsWith('f')
       ? ELEVENLABS_HINDI_FEMALE_VOICE_ID
       : ELEVENLABS_HINDI_MALE_VOICE_ID
@@ -2148,26 +2154,17 @@ async function generateVoiceover(text, outputPath, language) {
     console.log(`[server] Hindi: sending Devanagari directly to multilingual model`)
 
   } else if (isGujarati) {
-    // GUJARATI STRATEGY: Send native Gujarati script directly to ElevenLabs multilingual model.
-    // The romanize + collision map approach was causing severe mispronunciations
-    // (tested: native speaker scored it 2/10). ElevenLabs' eleven_turbo_v2_5
-    // handles Gujarati natively — same proven approach as Hindi.
+    // GUJARATI STRATEGY: Convert to native script → polish → romanize → pronunciation map.
+    // ElevenLabs' eleven_turbo_v2_5 does NOT handle native Gujarati script accurately.
+    // We get best results by romanizing to phonetic Latin and applying deterministic
+    // pronunciation rules, while using the Gujarati voice for natural accent color.
     if (isLatin) {
-      // Text is in romanized Gujarati — convert to native Gujarati script
-      console.log(`[server] Converting romanized Gujarati to native Gujarati script...`)
+      // Text is in romanized Gujarati — convert to native script first
+      // for proper grammar/spelling, then romanize back for precise TTS control
+      console.log(`[server] Converting romanized Gujarati to native script...`)
       try {
-        const sysPrompt = `You are a native Gujarati language expert. Convert the following romanized Gujarati text into proper Gujarati using the Gujarati script (ગુજરાતી લિપિ).
-
-CRITICAL RULES:
-- Return ONLY the converted Gujarati script text. No explanation.
-- Keep English brand names (like "Tata Tiscon", "iPhone", etc.) in English.
-- Keep English technical terms in English.
-- Use correct Gujarati grammar — do NOT use Hindi grammar patterns.
-- Use proper Gujarati words: "ને" not "ना", "માટે" not "के लिए", "જોઈએ" not "चाहिए", "પણ" not "भी".
-- Use correct gender forms: "મોંઘું" (neuter) not "મોંઘા/મોંઘો" for neuter nouns.
-- Numbers should be in Gujarati words: "પાંચસો પચાસ" not "five so pachas".
-- Ensure the unique Gujarati consonant "ળ" is used where needed (e.g., "મળતું" not "મિલતું").
-- Keep punctuation intact.`
+        const sysPrompt = `You are a native Gujarati language expert. Convert the following romanized Gujarati text into proper Gujarati using the Gujarati script.
+Return ONLY the converted text. Keep English brand names and words in English. Keep punctuation intact.`
         const converted = await callOpenAI(sysPrompt, spokenText, [])
         if (converted && converted.trim().length > 3 && /[\u0A80-\u0AFF]/.test(converted)) {
           spokenText = converted.trim()
@@ -2177,8 +2174,19 @@ CRITICAL RULES:
         console.warn(`[server] Gujarati script conversion failed, using romanized as-is:`, err.message)
       }
     }
-    // Do NOT apply collision maps or romanization — send Gujarati script directly
-    console.log(`[server] Gujarati: sending native script directly to multilingual model`)
+    // Step A — Polish for natural spoken delivery (works with native script)
+    spokenText = await polishVoiceoverForTts(spokenText, code)
+    // Step B — Romanize native script to phonetic Latin for ElevenLabs precision
+    const romanized = await phoneticRomanize(spokenText, 'gu', 'Gujarati')
+    if (romanized && romanized !== spokenText && !/[\u0A80-\u0AFF]/.test(romanized.slice(0, 3))) {
+      spokenText = romanized
+      console.log(`[server] Gujarati: romanized for TTS precision`)
+    }
+    // Step C — Apply pronunciation map for deterministic word-level fixes
+    for (const [regex, replacement] of GUJARATI_PRONUNCIATION_MAP) {
+      spokenText = spokenText.replace(regex, replacement)
+    }
+    console.log(`[server] Gujarati: sending romanized text with pronunciation map`)
 
   } else if (isIndian && hasNativeScript) {
     // Other Indian languages: send native script directly to multilingual model
@@ -2188,12 +2196,13 @@ CRITICAL RULES:
   // 4. Voice settings — tuned for natural, human-like Indian commercial delivery
   //    Higher stability = less robotic warble, higher similarity = stays closer to voice clone
   //    Lower style = less exaggerated "AI announcer" effect
-  if (isHindi || isGujarati) {
+  //    Note: Gujarati handles its own polish+romanization inside the branch above.
+  if (isHindi) {
     spokenText = await polishVoiceoverForTts(spokenText, code)
   }
 
   const voiceSettings = isGujarati
-    ? { stability: 0.40, similarity_boost: 0.85, style: 0.50, use_speaker_boost: true }
+    ? { stability: 0.50, similarity_boost: 0.90, style: 0.35, use_speaker_boost: true }
     : isHindi
       ? { stability: 0.45, similarity_boost: 0.82, style: 0.48, use_speaker_boost: true }
       : isIndian
